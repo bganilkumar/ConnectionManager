@@ -1,0 +1,733 @@
+/**
+ * 
+ */
+package com.airvana.loadtool.persistance;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.airvana.loadtool.client.DeviceModel;
+import com.airvana.loadtool.client.DeviceParameter;
+import com.airvana.loadtool.commons.JobLogger;
+import com.airvana.loadtool.commons.Tuple;
+import com.airvana.loadtool.commons.exceptions.CassandraException;
+import com.airvana.loadtool.persistance.connections.CassandraSession;
+import com.airvana.loadtool.persistance.connections.CassandraSessionManager;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.ResultSetFuture;
+import com.datastax.driver.core.exceptions.QueryValidationException;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+/**
+ * A Wrapper class which provides ease to perform CQL(Cassandra Query Language)
+ * queries on Cassandra.
+ * 
+ * <p>
+ * Below is the procedure to instantiate the DevicePersistence class. Please
+ * make sure the persistence is enabled for the current job to avoid exceptions.
+ * 
+ * <pre>
+ * // Get the DeviceInfo from SimuPool for the current job to verify persistence is
+ * // enabled.
+ * DeviceInfo info = SimuPool.getReference().getDeviceInfo();
+ * // verify if Persistence is enabled for the current job.
+ * if (info.isPersistenceEnabled()) {
+ * 	DevicePersistence devicePersistence = new DevicePersistence();
+ * 	try {
+ * 		devicePersistence.insert(Query);
+ * 		// any operation should be handled properly.
+ * 	} catch (CassandraConnectionNotAvailableException ex) {
+ * 	} finally {
+ * 		devicePersistence.end();
+ * 	}
+ * }
+ * </pre>
+ * 
+ * Once the PersistDevice has been created, it has to be end otherwise the
+ * created session will never to SessionManager this may cause OutOfMemoryError
+ * or may impact performance as CassandraSessionManager will only create max no.
+ * of sessions as defined once per pool.
+ * </p>
+ * 
+ * <p>
+ * Once the {@link DevicePersistence#end()} has been called, this class will not
+ * be able to make contact with {@link CassandraSession}. Should create a new
+ * PersistDevice again to get the behavior.
+ * </p>
+ * `
+ * 
+ * @author akballappagari
+ * 
+ */
+public final class DevicePersistence {
+
+	private static final JobLogger LOG = JobLogger
+			.getLogger(DevicePersistence.class);
+
+	/**
+	 * A local copy of CassandraSession which has initialized on
+	 * {@link DevicePersistence} creation. On successful end of
+	 * {@link DevicePersistence} this session will be returned to
+	 * {@link CassandraSessionManager}
+	 */
+	private CassandraSession session;
+
+	private boolean isSessionClosed;
+
+	/**
+	 * Which converts the given model object to JSON format.
+	 */
+	private Gson mapToJSONConvertor;
+
+	/**
+	 * local instance of {@link FaultExecutionsCache}
+	 */
+	private FaultExecutionsCache faultCache;
+
+	/**
+	 * Initializes the DevicePeristence and FaultExecutionsCache which stores
+	 * the fault executions incase of failures. <b>See</b>
+	 * {@link FaultExecutionsCache} for more info about faults.
+	 */
+	public DevicePersistence() {
+		faultCache = FaultExecutionsCache.getFaultExecutionCache();
+	}
+
+	/**
+	 * Applying lock to create session
+	 */
+	private Lock sessionLock = new ReentrantLock(false);
+
+	/**
+	 * Applying Lock to create MapToJSON converter.
+	 */
+	private Lock jsonLock = new ReentrantLock(false);
+
+	/**
+	 * Polls the Session from CassandraSessionManager
+	 * 
+	 * @throws CassandraException
+	 *             if any exception occurs while trying to poll the session.
+	 */
+	private void init() throws CassandraException {
+		if (!isSessionClosed) {
+			if (session == null) {
+				sessionLock.lock();
+				if (session == null) {
+					session = CassandraSession.open();
+				}
+				sessionLock.unlock();
+			}
+			if (mapToJSONConvertor == null) {
+				jsonLock.lock();
+				if (mapToJSONConvertor == null) {
+					mapToJSONConvertor = new GsonBuilder().create();
+				}
+				jsonLock.unlock();
+			}
+		}
+	}
+
+	/**
+	 * Performs SELECT query on give {@code serialno} and converts the retrieved
+	 * values to Map of String and {@link DeviceParameter} in async.
+	 * 
+	 * <p>
+	 * <b>see</b> {@link CassandraSession#executeAsync(query)} for more
+	 * information.
+	 * </p>
+	 * 
+	 * @param serialno
+	 *            for which SELECT query has to be performed.
+	 * @return model object
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public Map<String, DeviceParameter> getDeviceModelAsync(String serialno)
+			throws CassandraException {
+		init();
+		return convertToModelObj(serialno,
+				session.executeAsync(getModelQuery(serialno)));
+	}
+
+	/**
+	 * Performs SELECT query on give {@code serialno} and converts the retrieved
+	 * values to Map of String and {@link DeviceParameter}.
+	 * 
+	 * @param serialno
+	 *            for which SELECT query has to be performed.
+	 * @return model object
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public Map<String, DeviceParameter> getDeviceModel(String serialno)
+			throws CassandraException {
+		init();
+		return convertToModelObj(session.execute(getModelQuery(serialno)));
+	}
+
+	/**
+	 * Create Query or batch Query depending upon the fault cache. Returns a
+	 * {@link Tuple} which contains the Boolean(batch execution is true, else
+	 * false) as value1 and String(query to be executed) as value2.
+	 * 
+	 * @param serialno
+	 *            for which query is being created.
+	 * @param additionalQuery
+	 *            the query which has to be added to batch or to be executed
+	 *            alone
+	 * @return {@link Tuple<Boolean, String>}
+	 */
+	private Tuple<Boolean, String> createQuery(String serialno,
+			String additionalQuery) {
+		List<String> failedQueries = faultCache.getValues(serialno);
+		String query = null;
+		boolean batch = false;
+		if (failedQueries.size() > 0) {
+			batch = true;
+			failedQueries.add(additionalQuery);
+			query = getBatchQuery(failedQueries);
+		} else {
+			query = additionalQuery;
+		}
+		return new Tuple<Boolean, String>(batch, query);
+	}
+
+	/**
+	 * Executes the given query and returns a {@link ResultSet} which contains
+	 * the information about the execution.
+	 * 
+	 * @param serialno
+	 *            for which execution has to be taken
+	 * @param additionalQuery
+	 *            query to be executed
+	 * @return ResultSet of the execution
+	 * @throws CassandraException
+	 *             if any exception occurred while trying to execute.
+	 */
+	private ResultSet execute(String serialno, String additionalQuery)
+			throws CassandraException {
+		Tuple<Boolean, String> queryTuple = createQuery(serialno,
+				additionalQuery);
+		String query = queryTuple.getValue2();
+		boolean batch = queryTuple.getValue1();
+		ResultSet resultSet = null;
+		try {
+			resultSet = session.execute(query);
+		} catch (QueryValidationException qve) {
+			LOG.info("The Query trying to execute is not valid. Please verify..."
+					+ query);
+			LOG.error(qve);
+			throw new CassandraException(qve);
+		} catch (Exception e) {
+			if (batch) {
+				faultCache.put(serialno, parseBatch(query));
+			} else {
+				faultCache.put(serialno, query);
+			}
+			LOG.error("Error executing the query " + query
+					+ ". So, will perform a query on next execution.");
+			e.printStackTrace();
+			throw new CassandraException(e);
+		}
+		// if execution is successful, remove the values from batch...
+		if (batch) {
+			faultCache.remove(serialno);
+		}
+		return resultSet;
+	}
+
+	/**
+	 * Performs DELETE query on give {@code serialno}.
+	 * 
+	 * @param serialno
+	 *            for which DELETE query has to be performed.
+	 * @return {@link ResultSet} containing the result of the execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSet reset(String serialno) throws CassandraException {
+		init();
+		return execute(serialno, getDeleteQuery(serialno));
+	}
+
+	/**
+	 * Performs DELETE query on give {@code serialno} in async way.
+	 * 
+	 * @param serialno
+	 *            for which DELETE query has to be performed.
+	 * @return {@link ResultSetFuture} containing the result of the execution
+	 *         which can be accessed once the execution is done. Refer to
+	 *         {@link CassandraSession#executeAsync(String)} for more info
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSetFuture resetAsync(String serialno)
+			throws CassandraException {
+		init();
+		String query = getDeleteQuery(serialno);
+		ResultSetFuture futureSet = null;
+		futureSet = session.executeAsync(query);
+		// TODO : implement listeners to handle the Async executions.
+		return futureSet;
+	}
+
+	/**
+	 * Performs UPDATE query on give {@code serialno}.
+	 * 
+	 * @param serialno
+	 *            for which UPDATE query has to be performed.
+	 * @param updatedValues
+	 *            which needs to be updated.
+	 * @return {@link ResultSet} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSet update(String serialno,
+			Map<String, DeviceParameter> updatedValues)
+			throws CassandraException {
+		init();
+		return execute(serialno,
+				getUpdateQuery(serialno, convertModelObject(updatedValues)));
+	}
+
+	/**
+	 * Performs UPDATE query on give {@code serialno} in async way.
+	 * 
+	 * @param serialno
+	 *            for which UPDATE query has to be performed.
+	 * @param updatedValues
+	 *            which needs to be updated
+	 * @return {@link ResultSetFuture} of execution.
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSetFuture updateAsync(String serialno,
+			Map<String, DeviceParameter> updatedValues)
+			throws CassandraException {
+		init();
+		return session.executeAsync(getUpdateQuery(serialno,
+				convertModelObject(updatedValues)));
+	}
+
+	/**
+	 * Performs INSERT query on give {@code serialno}.
+	 * 
+	 * @param serialno
+	 *            for which insert query has to be performed.
+	 * @param values
+	 *            which has to be persisted
+	 * @return {@link ResultSet}
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSet insert(String serialno, Map<String, DeviceParameter> values)
+			throws CassandraException {
+		init();
+		return execute(serialno,
+				getInsertQuery(serialno, convertModelObject(values)));
+	}
+
+	/**
+	 * Performs INSERT query on give {@code serialno} in async way.
+	 * 
+	 * @param serialno
+	 *            for which insert query has to be performed.
+	 * @param values
+	 *            which has to be persisted.
+	 * @return {@link ResultSetFuture} of execution.
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSetFuture insertAsync(String serialno,
+			Map<String, DeviceParameter> values) throws CassandraException {
+		init();
+		return session.executeAsync(getInsertQuery(serialno,
+				convertModelObject(values)));
+	}
+
+	/**
+	 * Performs a SELECT query on given {@code serialno}.
+	 * 
+	 * @param serialno
+	 *            for which select query has to be performed.
+	 * @return {@link ResultSet} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSet select(String serialno) throws CassandraException {
+		init();
+		return execute(serialno, getSelectQuery(serialno));
+	}
+
+	/**
+	 * Performs a SELECT query on given {@code serialno} in async.
+	 * 
+	 * @param serialno
+	 *            for which select query has to be performed.
+	 * @return {@link ResultSetFuture} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSetFuture selectAsync(String serialno)
+			throws CassandraException {
+		init();
+		return session.executeAsync(getSelectQuery(serialno));
+	}
+
+	/**
+	 * Performs a SELECT query to get all the available serialno's in async.
+	 * 
+	 * @return {@link ResultSetFuture} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSetFuture getAllAvailableSerialNosAsync()
+			throws CassandraException {
+		init();
+		return session.executeAsync(getSerialSelectQuery());
+	}
+
+	/**
+	 * Performs a SELECT query to get all the available serialno's.
+	 * 
+	 * @return {@link ResultSet} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSet getAllAvailableSerialNosNow() throws CassandraException {
+		init();
+		ResultSet resultSet = null;
+		try {
+			resultSet = session.execute(getSerialSelectQuery());
+		} catch (Exception e) {
+			throw new CassandraException(e);
+		}
+		return resultSet;
+	}
+
+	/**
+	 * Performs a SELECT query to get all the available data.
+	 * 
+	 * @return {@link ResultSet} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSet simpleSelect() throws CassandraException {
+		init();
+		ResultSet resultSet = null;
+		try {
+			resultSet = session.execute(getSimpleSelectQuery());
+		} catch (Exception e) {
+			throw new CassandraException(e);
+		}
+		return resultSet;
+	}
+
+	/**
+	 * Performs a SELECT query to get all the available data in async.
+	 * 
+	 * @return {@link ResultSetFuture} of execution
+	 * @throws CassandraException
+	 *             if any exception occurs while cassandra operation.
+	 */
+	public ResultSetFuture simpleSelectAsync() throws CassandraException {
+		init();
+		return session.executeAsync(getSimpleSelectQuery());
+	}
+
+	/**
+	 * Returns true if for given {@code serialno} if any model object is
+	 * persisted, else returns false
+	 * 
+	 * @param serialno
+	 *            for which model object needs to be verified
+	 * @return true if model object is persisted for given serialno else false.
+	 */
+	public boolean isModelObjAvailable(String serialno) {
+		try {
+			return getDeviceModel(serialno).size() > 0 ? true : false;
+		} catch (CassandraException ccne) {
+			ccne.printStackTrace();
+			LOG.info("There was a problem while connecting to Cassandra. So, returning false assuming that no data is available.");
+		}
+		return false;
+	}
+
+	/**
+	 * Returns true if for given {@code serialno} if any model object is
+	 * persisted, else returns false. This process happens in async way. See
+	 * {@link DevicePersistence#getDeviceModelAsync(String)} for more details.
+	 * 
+	 * @param serialno
+	 *            for which model object needs to be verified
+	 * @return true if model object is persisted for given serialno else false.
+	 */
+	public boolean isModelObjAvailableAsync(String serialno) {
+		try {
+			return getDeviceModelAsync(serialno).size() > 0 ? true : false;
+		} catch (CassandraException ccne) {
+			ccne.printStackTrace();
+			LOG.info("There was a problem while connecting to Cassandra. So, returning false assuming that no data is available.");
+		}
+		return false;
+	}
+
+	/**
+	 * This marks the end of {@link DevicePersistence}. Once end has been
+	 * called, {@link DevicePersistence} is no longer available to perform
+	 * Queries.
+	 * 
+	 * @return true, if able to close, else false.
+	 */
+	public boolean end() {
+		try {
+			isSessionClosed = session.close();
+		} catch (Exception e) {
+			LOG.error(e);
+			LOG.info("Session not available to close");
+		}
+		return isSessionClosed;
+	}
+
+	/**
+	 * Returns true if {@link DevicePersistence#end()} is called, else false.
+	 * This might return a false even if {@link DevicePersistence#end()} has
+	 * been called due to Session not closed because of any exception.
+	 * 
+	 * @return true if closed, else false.
+	 */
+	public boolean isClosed() {
+		return isSessionClosed;
+	}
+
+	/**
+	 * Constructs and returns a SELECT CQL query to get all available data.
+	 * 
+	 * @return constructed select query.
+	 */
+	private String getSimpleSelectQuery() {
+		String query = "SELECT * from model ;";
+		logQuery(query);
+		return query;
+	}
+
+	/**
+	 * Constructs and returns a SELECT CQL query to get all available serialno's
+	 * data.
+	 * 
+	 * @return constructed select query.
+	 */
+	private String getSerialSelectQuery() {
+		String query = "SELECT serialno from model ;";
+		logQuery(query);
+		return query;
+	}
+
+	/**
+	 * Constructs and returns a SELECT CQL query to get modelobj from the given
+	 * {@code serialno}
+	 * 
+	 * @param serialno
+	 *            on which select query has to be performed
+	 * @return constructed select query.
+	 */
+	private String getSelectQuery(String serialno) {
+		String query = "SELECT * from model where serialno = '" + serialno
+				+ "';";
+		logQuery(query);
+		return query;
+	}
+
+	/**
+	 * Constructs and returns a INSERT CQL query to insert modelobj from the
+	 * given {@code serialno}
+	 * 
+	 * @param serialno
+	 *            for which modelobj has to be inserted.
+	 * @param values
+	 *            to be inserted as modelobj
+	 * @return constructed insert query.
+	 */
+	private String getInsertQuery(String serialno, Map<String, String> values) {
+		StringBuilder query = new StringBuilder();
+		query.append("INSERT INTO model(serialno, modelobj) VALUES(");
+		query.append("'").append(serialno).append("',");
+		query.append(mapToJSONConvertor.toJson(values).replaceAll("\"", "\'"))
+				.append(") ;");
+		logQuery(query.toString());
+		return query.toString();
+	}
+
+	/**
+	 * Constructs and returns a DELETE CQL query to delete modelobj from the
+	 * given {@code serialno}
+	 * 
+	 * @param serialno
+	 *            for which modelobj has to be deleted.
+	 * @return constructed update query
+	 */
+	private String getDeleteQuery(String serialno) {
+		String query = "DELETE FROM model WHERE serialno='" + serialno + "' ;";
+		logQuery(query);
+		return query;
+	}
+
+	/**
+	 * Constructs and returns a UPDATE CQL query to update modelobj from the
+	 * given {@code serialno}
+	 * 
+	 * @param serialno
+	 *            for which modelobj has to be updated.
+	 * @param updatedValues
+	 *            updated values of the modelobj.
+	 * @return constructed update query
+	 */
+	private String getUpdateQuery(String serialno,
+			Map<String, String> updatedValues) {
+		StringBuilder query = new StringBuilder();
+		query.append("UPDATE model SET modelobj=");
+		query.append(mapToJSONConvertor.toJson(updatedValues).replaceAll("\"",
+				"\'"));
+		query.append(" WHERE serialno='").append(serialno).append("' ;");
+		logQuery(query.toString());
+		return query.toString();
+	}
+
+	/**
+	 * Constructs and returns a SELECT CQL query to get modelobj from the given
+	 * {@code serialno}
+	 * 
+	 * @param serialno
+	 *            for which modelobj has to be retrieved.
+	 * @return constructed select query
+	 */
+	private String getModelQuery(String serialno) {
+		String query = "SELECT modelobj FROM model WHERE serialno = '"
+				+ serialno + "';";
+		logQuery(query);
+		return query;
+	}
+
+	/**
+	 * Retrieves the {@link DeviceModel#getObjectModel()} from give {@code set}.
+	 * 
+	 * @param set
+	 *            from which data has to be retrieved.
+	 * @return Map of String and DeviceParameter
+	 */
+	private Map<String, DeviceParameter> convertToModelObj(ResultSet set) {
+		Map<String, DeviceParameter> modelObj = Maps.newHashMap();
+		if (!set.isExhausted()) {
+			for (Map.Entry<String, String> modelEntry : set.one()
+					.getMap(0, String.class, String.class).entrySet()) {
+				modelObj.put(modelEntry.getKey(), new DeviceParameter(
+						modelEntry.getKey(), modelEntry.getValue()));
+			}
+		}
+		return modelObj;
+	}
+
+	/**
+	 * Retrieves the {@link DeviceModel#getObjectModel()} from given
+	 * {@code futureSet}.
+	 * 
+	 * @param serialno
+	 *            for which object model has to be retrieved.
+	 * @param futureSet
+	 *            from which data has to be retrieved.
+	 * @return Map of String and DeviceParameter
+	 */
+	private Map<String, DeviceParameter> convertToModelObj(String serialno,
+			ResultSetFuture futureSet) {
+		Map<String, DeviceParameter> modelObj = Maps.newHashMap();
+		try {
+			ResultSet set = futureSet.getUninterruptibly(1000,
+					TimeUnit.MILLISECONDS);
+			if (!set.isExhausted()) {
+				for (Map.Entry<String, String> modelEntry : set.one()
+						.getMap(0, String.class, String.class).entrySet()) {
+					modelObj.put(modelEntry.getKey(), new DeviceParameter(
+							modelEntry.getKey(), modelEntry.getValue()));
+				}
+			}
+		} catch (TimeoutException e) {
+			LOG.error(e);
+			LOG.info("Unable to retrieve the data for: " + serialno);
+			return modelObj;
+		}
+		return modelObj;
+	}
+
+	/**
+	 * Convert the given {@code modelObj} to Map<String, String>
+	 * 
+	 * @param modelObj
+	 *            which has to be converted
+	 * @return converted {@code modelObj} to Map<String, String>
+	 */
+	private Map<String, String> convertModelObject(
+			Map<String, DeviceParameter> modelObj) {
+		Map<String, String> convertedModelObj = Maps.newHashMap();
+		for (Map.Entry<String, DeviceParameter> entry : modelObj.entrySet()) {
+			convertedModelObj.put(entry.getKey(), entry.getValue()
+					.getStringValue());
+		}
+		return convertedModelObj;
+	}
+
+	/**
+	 * Generate Batch CQL
+	 * 
+	 * @param queries
+	 *            list which needs to be nested in batch
+	 * @return batch query
+	 */
+	private String getBatchQuery(List<String> queries) {
+		String batchQ = null;
+		StringBuilder batchQuery = new StringBuilder();
+		batchQuery.append("BEGIN BATCH ");
+		for (String query : queries) {
+			batchQuery.append(query).append(" ");
+		}
+		batchQuery.append("APPLY BATCH;");
+		batchQ = batchQuery.toString();
+		logQuery(batchQ);
+		return batchQ;
+	}
+
+	/**
+	 * Split's the given batch statement to single execution statements. This is
+	 * used to support fault cache.
+	 * 
+	 * @param query
+	 *            to be split
+	 * @return list of queries from batch query
+	 */
+	private List<String> parseBatch(String query) {
+		List<String> queries = Lists.newLinkedList();
+		query = query.replaceFirst("BEGIN BATCH ", "").replaceFirst(
+				"APPLY BATCH;", "");
+		for (String parsedQuery : query.split(";")) {
+			queries.add(parsedQuery.trim());
+		}
+		return queries;
+	}
+
+	/**
+	 * LOG the query
+	 * 
+	 * @param query
+	 *            to be logged
+	 */
+	private void logQuery(String query) {
+		LOG.info("Performing Query: " + query);
+	}
+}

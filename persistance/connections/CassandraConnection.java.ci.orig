@@ -1,0 +1,226 @@
+/**
+ * 
+ */
+package com.airvana.loadtool.persistance.connections;
+
+import static com.airvana.loadtool.persistance.connections.constants.CassandraInfoKeys.CASSANDRA_KEYSPACNE_NAME;
+import static com.airvana.loadtool.persistance.connections.constants.CassandraInfoKeys.CASSANDRA_NODE_COUNT;
+import static com.airvana.loadtool.persistance.connections.constants.CassandraInfoKeys.CASSANDRA_NODE_NAME;
+import static com.airvana.loadtool.persistance.connections.constants.CassandraInfoKeys.CASSANDRA_SSL;
+
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import com.airvana.loadtool.commons.CommonUtility;
+import com.airvana.loadtool.commons.JobLogger;
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.Cluster.Builder;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.policies.DefaultRetryPolicy;
+import com.datastax.driver.core.policies.ExponentialReconnectionPolicy;
+import com.datastax.driver.core.policies.LoadBalancingPolicy;
+import com.datastax.driver.core.policies.ReconnectionPolicy;
+import com.datastax.driver.core.policies.RetryPolicy;
+import com.datastax.driver.core.policies.RoundRobinPolicy;
+import com.datastax.driver.core.policies.TokenAwarePolicy;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+
+/**
+ * CassandraConnection which creates the connection to the Cassandra using
+ * cassandra-driver-core.jar file.
+ * <p>
+ * This initiates the connection with Cassandra with specific policies. This is
+ * an entry point to Cassandra.
+ * </p>
+ * 
+ * <p>
+ * CassandraConnection creates a Cassandra {@link Cluster} object and interacts
+ * through it to Cassandra. The default port currently used is 9042 which is a
+ * native transport port declared in cassandra.yaml file of cassandra
+ * installation.
+ * </p>
+ * 
+ * <p>
+ * CassandraConnection initialized with a set of default policies. The default
+ * policies used are
+ * <p>
+ * 1) {@link TokenAwarePolicy} is a {@link LoadBalancingPolicy}. See
+ * {@link TokenAwarePolicy} and {@link LoadBalancingPolicy} on load balancing
+ * options in cassandra.
+ * </p>
+ * <p>
+ * 2) DefaultRetryPolicy for Retry mechanism. See {@link DefaultRetryPolicy} and
+ * {@link RetryPolicy} for more info on retry policies in cassandra.
+ * </p>
+ * <p>
+ * 3) ExponentialReconnectionPolicy for reconnection mechanism to Cassandra. See
+ * {@link ExponentialReconnectionPolicy} and {@link ReconnectionPolicy} for more
+ * info on reconnection policies in cassandra.
+ * </p>
+ * </p>
+ * 
+ * <p>
+ * Below is the example code snippet on how to create a CassandraConnection
+ * object.
+ * 
+ * <pre>
+ * CassandraConnection connection = new CassandraConnection();
+ * </pre>
+ * 
+ * The above instantiation can only be done by {@link CassandraSessionManager}.
+ * No other classes should try to instantiate as CassandraSessionManager is
+ * optimized to handle the connection and session objects effectively.
+ * 
+ * </p>
+ * 
+ * <p>
+ * This class uses conf/persistence/cassandra-config.properties for nodes,
+ * keyspace and other informations required to create connection with Cassandra.
+ * </p>
+ * 
+ * @author akballappagari
+ * 
+ */
+public final class CassandraConnection {
+
+	/**
+	 * {@link JobLogger} to log the information.
+	 */
+	private static final JobLogger LOG = JobLogger
+			.getLogger(CassandraConnection.class);
+
+	/**
+	 * {@link Cluster} instance for the given nodes.
+	 */
+	private final Cluster cluster;
+
+	/**
+	 * All the information that has been given in
+	 * conf/persitence/cassandra-config.properties file
+	 */
+	private final Map<String, String> CASSANDRA_INFO;
+
+	/**
+	 * Cassandra nodes to which connection needs to be made.
+	 */
+	private final Collection<InetAddress> CASSANDRA_NODES;
+
+	/**
+	 * The key's to get the nodes from cassandra-config.properties.
+	 */
+	private final List<String> CASSANDRA_NODE_KEYS;
+
+	/**
+	 * Initializes all the prerequisites for connection.
+	 */
+	protected CassandraConnection() {
+		CASSANDRA_INFO = loadCassandraInfo();
+		CASSANDRA_NODE_KEYS = generateNodeKeys();
+		CASSANDRA_NODES = loadCassandraNodes();
+		cluster = initCluster();
+	}
+
+	/**
+	 * Loads the cassandra-config.properties
+	 * 
+	 * @return cassandra config information inform of Map.
+	 */
+	private Map<String, String> loadCassandraInfo() {
+		return Collections
+				.unmodifiableMap(Maps.fromProperties(CommonUtility
+						.loadProperties("conf/persistence/cassandra-config.properties")));
+	}
+
+	/**
+	 * Creates the {@link InetAddress} of the nodes given in cassandra config.
+	 * 
+	 * @return Collection of InetAddress of nodes provided.
+	 */
+	private Collection<InetAddress> loadCassandraNodes() {
+		List<InetAddress> cassandraNodes = Lists.newArrayList();
+		for (String node : CASSANDRA_NODE_KEYS) {
+			try {
+				cassandraNodes.add(InetAddress.getByName(CASSANDRA_INFO
+						.get(node)));
+			} catch (UnknownHostException uhe) {
+				LOG.error("The provided host " + CASSANDRA_INFO.get(node)
+						+ " may not exist. Please verify.");
+				uhe.printStackTrace();
+			}
+		}
+		return Collections.unmodifiableCollection(cassandraNodes);
+	}
+
+	/**
+	 * Generate the keys to fetch the nodes from cassandra config
+	 * 
+	 * @return List of node keys.
+	 */
+	private List<String> generateNodeKeys() {
+		int count = Integer.parseInt(CASSANDRA_INFO.get(CASSANDRA_NODE_COUNT));
+		String nodeName = CASSANDRA_NODE_NAME;
+		List<String> nodeNames = Lists.newArrayList();
+		for (; count > 0;) {
+			nodeNames.add(nodeName.replaceFirst("<N>", (--count) + ""));
+		}
+		return Collections.unmodifiableList(nodeNames);
+	}
+
+	/**
+	 * Initializes the cluster. This is the entry point to Cassandra.
+	 * 
+	 * @return the newly built Cluster instance.
+	 */
+	private Cluster initCluster() {
+		Builder builder = Cluster.builder().addContactPoints(CASSANDRA_NODES);
+		loadPolicies(builder);
+		if (isSSLEnabled()) {
+			builder.withSSL();
+		}
+		return builder.build();
+	}
+
+	/**
+	 * loads the policies to cluster.
+	 * 
+	 * @param builder
+	 *            {@link Builder} which builds the {@link Cluster}.
+	 */
+	private void loadPolicies(Builder builder) {
+		builder.withLoadBalancingPolicy(new TokenAwarePolicy(
+				new RoundRobinPolicy()));
+
+		builder.withRetryPolicy(DefaultRetryPolicy.INSTANCE);
+
+		builder.withReconnectionPolicy(new ExponentialReconnectionPolicy(100,
+				1000));
+	}
+
+	/**
+	 * Returns true if cassandra connection is SSL enabled, else false.
+	 * 
+	 * @return true/false.
+	 */
+	private boolean isSSLEnabled() {
+		return Boolean.valueOf(CASSANDRA_INFO.get(CASSANDRA_SSL));
+	}
+
+	/**
+	 * Creates the Cassandra {@link Session} on the current cluster. Initialize
+	 * it and sets the keyspace to the provided one.
+	 * 
+	 * <p>
+	 * Note that this method will initialize the newly created session, trying
+	 * to connect to the Cassandra nodes before returning.
+	 *</p> 
+	 * @return
+	 */
+	protected final Session createSession() {
+		return cluster.connect(CASSANDRA_INFO.get(CASSANDRA_KEYSPACNE_NAME));
+	}
+}

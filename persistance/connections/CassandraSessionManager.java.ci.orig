@@ -1,0 +1,163 @@
+/**
+ * 
+ */
+package com.airvana.loadtool.persistance.connections;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.airvana.loadtool.client.JobConfiguration;
+import com.airvana.loadtool.commons.exceptions.CassandraConnectionNotAvaialbleException;
+import com.datastax.driver.core.CloseFuture;
+import com.datastax.driver.core.Session;
+import com.google.common.collect.Lists;
+
+/**
+ * <p>
+ * CassandraSessionManager manages the Cassandra Session objects. This creates
+ * the {@link Session} objects and stores them in the pool.
+ * </p>
+ * 
+ * 
+ * <p>
+ * The maximum no. of sessions created depends upon the max connection pool
+ * defined in conf/jobconfiguration.properties file.
+ * </p>
+ * 
+ * <p>
+ * The CassandraSessionManager should be instantiated by using
+ * {@link #getSessionManager()}
+ * </p>
+ * 
+ * 
+ * @author akballappagari
+ * 
+ */
+public final class CassandraSessionManager {
+
+	/**
+	 * local instance of CassandraSessionManager. Only once instance created per
+	 * job.
+	 */
+	private static CassandraSessionManager sessionManager;
+
+	/**
+	 * lock applied on CassandraSessionManager to avoid race conditions.
+	 */
+	private static Lock sessionInitlock = new ReentrantLock(true);
+
+	/**
+	 * CassandraConnection object instance which helps to create the Cassandra
+	 * {@link Session}
+	 */
+	private final CassandraConnection connection;
+
+	/**
+	 * Total no. of sessions available per pool.
+	 */
+	private static final int MAX_AVAILABILITY_PER_POOL = JobConfiguration.cassandraMaxPool; //10;
+
+	/**
+	 * A counting {@link Semaphore} used to retrieve the session from pool.
+	 */
+	private final Semaphore sessionAvailablity = new Semaphore(
+			MAX_AVAILABILITY_PER_POOL, false);
+
+	/**
+	 * A Queue which acts a {@link Session} pool. This maintains the Session
+	 * pool.
+	 */
+	private static final BlockingQueue<Session> sessionsQueue = new LinkedBlockingQueue<Session>(
+			MAX_AVAILABILITY_PER_POOL);
+
+	/**
+	 * CassandraSessionManager initialized privately to protect from outside
+	 * instantiations.
+	 */
+	private CassandraSessionManager() {
+		connection = new CassandraConnection();
+	}
+
+	/**
+	 * Creates and returns {@link CassandraSessionManager} if not created else
+	 * will return already created manager.
+	 * 
+	 * @return CassandraSessionManager object.
+	 */
+	protected final static CassandraSessionManager getSessionManager() {
+		sessionInitlock.lock();
+		if (sessionManager == null) {
+			sessionManager = new CassandraSessionManager();
+		}
+		sessionInitlock.unlock();
+		return sessionManager;
+	}
+
+	/**
+	 * Creates and returns {@link Session}.
+	 * <p>
+	 * a) Will return Session from the {@link #sessionsQueue} if any available
+	 * in the pool.
+	 * </p>
+	 * <p>
+	 * b) Will create and return the session, if not available in pool and max
+	 * sessions are not created.
+	 * </p>
+	 * <p>
+	 * c) If max sessions are created and none are available in pool, will wait
+	 * till session's are available in pool or throws
+	 * {@link CassandraConnectionNotAvaialbleException} if failed to retrieve
+	 * one.
+	 * </p>
+	 * 
+	 * @return {@link Session} object from the pool.
+	 * @throws CassandraConnectionNotAvaialbleException
+	 *             if creation or retrieval of session fails.
+	 */
+	protected Session getSession()
+			throws CassandraConnectionNotAvaialbleException {
+		try {
+			sessionAvailablity.acquire();
+			if (sessionsQueue.peek() == null) {
+				return connection.createSession();
+			}
+		} catch (Exception e) {
+			throw new CassandraConnectionNotAvaialbleException(
+					"Connection not available", e);
+		}
+		return sessionsQueue.poll();
+	}
+
+	/**
+	 * Stores the given session object to pool.
+	 * 
+	 * @param session
+	 *            session which needs to be returned.
+	 * @return true if successfully stored into pool, else false.
+	 */
+	protected boolean close(Session session) {
+		sessionAvailablity.release();
+		boolean offered = sessionsQueue.offer(session);
+		return offered;
+	}
+
+	/**
+	 * Shuts down all sessions in the pool. For more information refer to
+	 * {@link Session#closeAsync()}
+	 * 
+	 * @see Session#closeAsync()
+	 * @return {@link CloseFuture} list which contains the session closing information.
+	 */
+	public static List<CloseFuture> shutdown() {
+		List<CloseFuture> closeFutureList = Lists.newArrayList();
+		while (sessionsQueue.peek() != null) {
+			closeFutureList.add(sessionsQueue.poll().closeAsync());
+		}
+		return Collections.unmodifiableList(closeFutureList);
+	}
+}
